@@ -63,6 +63,8 @@ class RAFT(nn.Module):
     def initialize_flow(self, img):
         """ Flow is represented as difference between two coordinate grids flow = coords1 - coords0"""
         N, C, H, W = img.shape
+
+        # create two coordinate grids with shape (batch, 2, H//8, W//8)
         coords0 = coords_grid(N, H//8, W//8, device=img.device)
         coords1 = coords_grid(N, H//8, W//8, device=img.device)
 
@@ -86,9 +88,11 @@ class RAFT(nn.Module):
     def forward(self, image1, image2, iters=12, flow_init=None, upsample=True, test_mode=False):
         """ Estimate optical flow between pair of frames """
 
+        # map color values [0,255] -> [-1,1]
         image1 = 2 * (image1 / 255.0) - 1.0
         image2 = 2 * (image2 / 255.0) - 1.0
 
+        # make image tensors contiguous (re-initialize tensor with memory format accomodating the tensors metadata)
         image1 = image1.contiguous()
         image2 = image2.contiguous()
 
@@ -99,32 +103,55 @@ class RAFT(nn.Module):
         with autocast(enabled=self.args.mixed_precision):
             fmap1, fmap2 = self.fnet([image1, image2])        
         
+        # cast the per-8x8-pixel features to float32
         fmap1 = fmap1.float()
         fmap2 = fmap2.float()
+
         if self.args.alternate_corr:
             corr_fn = AlternateCorrBlock(fmap1, fmap2, radius=self.args.corr_radius)
         else:
+            # creates the correlation volume 
+            # it is wrapped in an object with methods for querying using coordinate grid
             corr_fn = CorrBlock(fmap1, fmap2, radius=self.args.corr_radius)
 
-        # run the context network
+        # run the context network (provides initial hidden state and context features)
         with autocast(enabled=self.args.mixed_precision):
+            # the context network produces the initial hidden state (net) and the context features (inp) 
             cnet = self.cnet(image1)
             net, inp = torch.split(cnet, [hdim, cdim], dim=1)
             net = torch.tanh(net)
             inp = torch.relu(inp)
 
+        # coords0 and coords1 are initialized to coordinate grids of shape (batch, 2, ht, wd)
         coords0, coords1 = self.initialize_flow(image1)
 
+        # as: 
+        # flow = coords1 - coords0; 
+        # then adding the inital flow to coords1 causes: 
+        # flow = coords1 + flow_init - coords0 = flow_init
         if flow_init is not None:
             coords1 = coords1 + flow_init
 
+        # flow predictions at every stage are stored in a list
         flow_predictions = []
+
+        # repeat optimization
         for itr in range(iters):
+
+            # detaching coords1 from current computation graph
+            # this makes sense because gradient should not be propagated on the route through coords1 to previous optimization stages
+            # another reason would be because the flow calculated from coords1 is used for indexing 
             coords1 = coords1.detach()
+            
+            # call method of the correlation volume object
+            # queries correlation values at all correlation volume levels
+            # resulting shape: (batch, num_levels*dim*(2*r+1)*(2*r+1), h1, w1)
             corr = corr_fn(coords1) # index correlation volume
 
+            # recompute flow from coords1
             flow = coords1 - coords0
             with autocast(enabled=self.args.mixed_precision):
+                # update block receives inital hidden state, context features, correlation features and current flow estimate
                 net, up_mask, delta_flow = self.update_block(net, inp, corr, flow)
 
             # F(t+1) = F(t) + \Delta(t)

@@ -55,15 +55,39 @@ def forward_interpolate(flow):
 
 
 def bilinear_sampler(img, coords, mode='bilinear', mask=False):
-    """ Wrapper for grid_sample, uses pixel coordinates """
+    """ Wrapper for grid_sample, uses pixel coordinates
+
+    Args:
+        img (torch.Tensor): correlation volume of shape (batch*h1*w1, dim, h2, w2)
+        coords (torch.Tensor): coordinates to sample for each pixel of shape (batch*h1*w1, 2*r+1, 2*r+1, 2)
+        mode (str, optional): Not accessed by program currently - could be passed to grid_sample. Defaults to 'bilinear'.
+        mask (bool, optional): Whether to return the mask being 1.0 for pixels outside of grid,
+                                same shape as return value. Defaults to False.
+
+    Returns:
+        torch.Tensor: sampled correlation values for the specified coordinates, shape (batch*h1*w1, dim, 2*r+1, 2*r+1)
+                        correlation values sampled around the current estimated image2 location for each image1 pixel
+    """
+    
+    # H = h2, W = w2
     H, W = img.shape[-2:]
+
+    # split coords into x/y-values:
+    # (batch*h1*w1, 2*r+1, 2*r+1, 2) -> (batch*h1*w1, 2*r+1, 2*r+1, 1), (batch*h1*w1, 2*r+1, 2*r+1, 1)
     xgrid, ygrid = coords.split([1,1], dim=-1)
+    
+    # map grid coordinate ranges: [0,W-1] -> [-1, 1] ; [0,H-1] -> [-1, 1]
     xgrid = 2*xgrid/(W-1) - 1
     ygrid = 2*ygrid/(H-1) - 1
 
+    # merge x/y-coords after range transformation:
+    # (batch*h1*w1, 2*r+1, 2*r+1, 1), (batch*h1*w1, 2*r+1, 2*r+1, 1) -> (batch*h1*w1, 2*r+1, 2*r+1, 2)
     grid = torch.cat([xgrid, ygrid], dim=-1)
+
+    # sampled correlation volume points of shape (batch*h1*w1, dim, 2*r+1, 2*r+1)
     img = F.grid_sample(img, grid, align_corners=True)
 
+    # create mask with 1.0 for coordinates outside the correlation volume, otherwise 0.0
     if mask:
         mask = (xgrid > -1) & (ygrid > -1) & (xgrid < 1) & (ygrid < 1)
         return img, mask.float()
@@ -72,8 +96,37 @@ def bilinear_sampler(img, coords, mode='bilinear', mask=False):
 
 
 def coords_grid(batch, ht, wd, device):
+    """ creates a tensor which contains the coordinates of previous dimensions
+
+    Args:
+        batch (int): batch size
+        ht (int): image height
+        wd (int): image width
+        device (int): device for computation
+
+    Returns:
+        torch.Tensor: _description_
+    """
+
+    # resulting coords tensor looks like this:
+    # tensor(  [[[0., 1., 2., 3., 4.],
+    #           [0., 1., 2., 3., 4.],
+    #           [0., 1., 2., 3., 4.],
+    #           [0., 1., 2., 3., 4.]],
+
+    #          [[0., 0., 0., 0., 0.],
+    #           [1., 1., 1., 1., 1.],
+    #           [2., 2., 2., 2., 2.],
+    #           [3., 3., 3., 3., 3.]]])
+
+
+    # first step: create meshgrid that is separate for each dimension: (ht,wd), (ht,wd)
     coords = torch.meshgrid(torch.arange(ht, device=device), torch.arange(wd, device=device))
+    # second step: create meshgrid that is reversed and merged with shape: (2,ht,wd)
+    # reversal: (coords[0][i][j],coords[1][i][j]) = (j,i)
     coords = torch.stack(coords[::-1], dim=0).float()
+    # add a batch dimension using [None] (shape (2, ht, wd) -> (1, 2, ht, wd))
+    # and then clone the coords along the batch dimension: shape (1, 2, ht, wd) -> (batch, 2, ht, wd)
     return coords[None].repeat(batch, 1, 1, 1)
 
 

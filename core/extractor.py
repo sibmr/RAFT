@@ -247,6 +247,7 @@ class SmallEncoder(nn.Module):
         is_list = isinstance(x, tuple) or isinstance(x, list)
         if is_list:
             batch_dim = x[0].shape[0]
+            # process both images as batch with new shape: (2*batch_dim,...)
             x = torch.cat(x, dim=0)
 
         x = self.conv1(x)
