@@ -54,11 +54,19 @@ def sequence_loss(flow_preds, flow_gt, valid, gamma=0.8, max_flow=MAX_FLOW):
     mag = torch.sum(flow_gt**2, dim=1).sqrt()
     valid = (valid >= 0.5) & (mag < max_flow)
 
+    # calculate loss for each optimization iteration
     for i in range(n_predictions):
+        # first iteration has lowest weight gamma**(n_predictions-1), 
+        # last one has gamma**0 = 1 
         i_weight = gamma**(n_predictions - i - 1)
+        # the loss at each stage is the mean over all pixels of the l1-norm of the estimated-gt-flow-difference
+        # non-valid pixels absolute difference is not counted
+        # i_loss shape: (batch, 2, ht, wd) ; valid[:,None] shape: (batch, 1, ht, wd)
         i_loss = (flow_preds[i] - flow_gt).abs()
         flow_loss += i_weight * (valid[:, None] * i_loss).mean()
 
+    # calculate metrics
+    # calculate end point error for each pixel (euclidean distance true and estimated flow vector/position)
     epe = torch.sum((flow_preds[-1] - flow_gt)**2, dim=1).sqrt()
     epe = epe.view(-1)[valid.view(-1)]
 
@@ -135,22 +143,33 @@ class Logger:
 
 def train(args):
 
+    # DataParallel splits input to the module into chunks in the batch dimension
+    # the forward and backward pass can be done independently on each of the devices
     model = nn.DataParallel(RAFT(args), device_ids=args.gpus)
     print("Parameter Count: %d" % count_parameters(model))
 
+    # load model parameters from file
     if args.restore_ckpt is not None:
         model.load_state_dict(torch.load(args.restore_ckpt), strict=False)
 
     model.cuda()
     model.train()
 
+    # collect mean/variance statistics on chairs training
+    # use these statistics during the rest of the training stages
     if args.stage != 'chairs':
         model.module.freeze_bn()
 
+    # instance of torch.utils.data.DataLoader for some dataset of type torch.utils.data.Dataset
+    # get the data loader that corresponds to the current training stage (chairs, things, sintel, kitti, hd1k)
     train_loader = datasets.fetch_dataloader(args)
+    # get the optimizer and (learning rate) scheduler
     optimizer, scheduler = fetch_optimizer(args, model)
 
     total_steps = 0
+    # gradient scaler multiplies loss by some factor to prevent underflows that can happen with float16 precision
+    # after gradient is accumulated, gradients are divided by this factor such that they do not interfere with the 
+    # learning rate
     scaler = GradScaler(enabled=args.mixed_precision)
     logger = Logger(model, scheduler)
 
@@ -159,29 +178,51 @@ def train(args):
 
     should_keep_training = True
     while should_keep_training:
-
+        
+        # iterate over batches
         for i_batch, data_blob in enumerate(train_loader):
+            
+            # set weight tensor gradients to zero
             optimizer.zero_grad()
+
+            # send image1/image2/flow/valid_flow batches to the gpu
             image1, image2, flow, valid = [x.cuda() for x in data_blob]
 
+            # add noise to images
             if args.add_noise:
                 stdv = np.random.uniform(0.0, 5.0)
                 image1 = (image1 + stdv * torch.randn(*image1.shape).cuda()).clamp(0.0, 255.0)
                 image2 = (image2 + stdv * torch.randn(*image2.shape).cuda()).clamp(0.0, 255.0)
 
+            # forward pass
             flow_predictions = model(image1, image2, iters=args.iters)            
 
+            # calculate loss
             loss, metrics = sequence_loss(flow_predictions, flow, valid, args.gamma)
+            
+            # backward pass with scaled loss/gradients
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)                
+
+            # unscale gradients on the weights
+            scaler.unscale_(optimizer)        
+
+            # if the magnitude of the gradient vector exceeds a certain threshold according to some norm
+            # then multiply the unit gradient by that threshold and set it as the new gradient
+            # especially useful for recurrent neural networks suffering from exploding gradient problem
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
             
+            # step optimizer with scaler, with unscaling if not already done and checks for over/underflow
             scaler.step(optimizer)
+            
+            # step the (learning rate) schedule
             scheduler.step()
+
+            # updates the scale factor (in reaction to occurrence of nan/inf params and thus skipped optimization steps)
             scaler.update()
 
             logger.push(metrics)
 
+            # validation during training for monitoring
             if total_steps % VAL_FREQ == VAL_FREQ - 1:
                 PATH = 'checkpoints/%d_%s.pth' % (total_steps+1, args.name)
                 torch.save(model.state_dict(), PATH)
@@ -203,6 +244,7 @@ def train(args):
             
             total_steps += 1
 
+            # stop training after specified number of steps (batches)
             if total_steps > args.num_steps:
                 should_keep_training = False
                 break

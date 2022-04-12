@@ -56,6 +56,12 @@ class RAFT(nn.Module):
             self.update_block = BasicUpdateBlock(self.args, hidden_dim=hdim)
 
     def freeze_bn(self):
+        """ put all batch norm modules into evaluation mode
+            this leads to the modules not using the current batch statistics,
+            but instead using the overall mean and variance estimates collected during training
+
+            why only freeze instances of batch norm -> other norms may be chosen in arguments
+        """
         for m in self.modules():
             if isinstance(m, nn.BatchNorm2d):
                 m.eval()
@@ -74,14 +80,32 @@ class RAFT(nn.Module):
     def upsample_flow(self, flow, mask):
         """ Upsample flow field [H/8, W/8, 2] -> [H, W, 2] using convex combination """
         N, _, H, W = flow.shape
+
+        # mask dimensions: (N: batch, 1, 9: weights per upsampled pixel,
+        # 8: number of upsampled pixels in height dir,
+        # 8: number of upsampled pixels in width dir, image height, image width)
         mask = mask.view(N, 1, 9, 8, 8, H, W)
+
+        # make weights for each upsampled pixel sum to one
         mask = torch.softmax(mask, dim=2)
 
+        # copy 3x3 windows around each pixel, 
+        # shape: (batch, 2, ht, wd) -> (batch, 2*3*3, number_of_blocks: ht*wd)
         up_flow = F.unfold(8 * flow, [3,3], padding=1)
+        # shape: (batch, 2*3*3, number_of_blocks: ht*wd) -> (batch, 2, 9, 1, 1, ht, wd)
         up_flow = up_flow.view(N, 2, 9, 1, 1, H, W)
 
+        # do the multiplication of the 9 weights with the 9 pixels
+        # (N, 1, 9, 8, 8, H, W) * (N, 2, 9, 1, 1, H, W) -> (N, 2, 9, 8, 8, H, W)
+        # sum over the weighted pixel values for each upsampled pixel in the (8,8) window
+        # shape: (N, 2, 9, 8, 8, H, W) -> (N, 2, 8, 8, H, W)
         up_flow = torch.sum(mask * up_flow, dim=2)
+        
+        # permute: (N, 2, 8, 8, H, W) -> (N, 2, H, 8, W, 8)
         up_flow = up_flow.permute(0, 1, 4, 2, 5, 3)
+
+        # reshape (itegrate upsampled pixels into height/width dimension)
+        # shape: (N, 2, H, 8, W, 8) -> (N, 2, 8*H, 8*W)
         return up_flow.reshape(N, 2, 8*H, 8*W)
 
 
@@ -159,8 +183,11 @@ class RAFT(nn.Module):
 
             # upsample predictions
             if up_mask is None:
+                # simple bilinear upsampling of the flow
                 flow_up = upflow8(coords1 - coords0)
             else:
+                # upsampling based on the upsampling weights produced 
+                # by hidden state + mask convolutions in update module
                 flow_up = self.upsample_flow(coords1 - coords0, up_mask)
             
             flow_predictions.append(flow_up)

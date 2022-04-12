@@ -131,5 +131,14 @@ def coords_grid(batch, ht, wd, device):
 
 
 def upflow8(flow, mode='bilinear'):
+    """simple bilinear interpolation to upsample the flow by a factor of 8
+
+    Args:
+        flow (torch.Tensor): current low-res flow estimate - shape: (batch, 2, ht, wd)
+        mode (str, optional): interpolation type. Defaults to 'bilinear'.
+
+    Returns:
+        torch.Tensor: upsampled flow - shape: (batch, 2, 8*ht, 8*wd)
+    """
     new_size = (8 * flow.shape[2], 8 * flow.shape[3])
     return  8 * F.interpolate(flow, size=new_size, mode=mode, align_corners=True)

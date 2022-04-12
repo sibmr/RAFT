@@ -72,6 +72,7 @@ class CorrBlock:
             # meshgrid of local coordinates: reversed since dy first
             # fitting since coords is also reversed with y first
             # this has shape (2*r+1, 2*r+1, 2)
+            # implies use of infinity norm ||dx||_inf in contrast to paper with 1-norm ||dx||_1
             delta = torch.stack(torch.meshgrid(dy, dx), axis=-1)
 
             # shape (batch, ht, wd, 2) -> (batch*ht*wd, 1, 1, 2)

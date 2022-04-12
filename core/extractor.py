@@ -13,39 +13,61 @@ class ResidualBlock(nn.Module):
 
         num_groups = planes // 8
 
+        # compute per-group statistics for each group (statistics over channels in group, width, height)
+        # in this case, each group contains 8 consecutive channels of the input
+        # group norm includes shifting/scaling of the result by learnable parameters
         if norm_fn == 'group':
             self.norm1 = nn.GroupNorm(num_groups=num_groups, num_channels=planes)
             self.norm2 = nn.GroupNorm(num_groups=num_groups, num_channels=planes)
             if not stride == 1:
                 self.norm3 = nn.GroupNorm(num_groups=num_groups, num_channels=planes)
         
+        # compute per-batch statistics for each channel (statistics over batch, width, height)
+        # it sets the mean to 0 and the standart deviation to 1
+        # then shifts and scales by learned parameters
+        # applied to accelerate the training of the network
         elif norm_fn == 'batch':
             self.norm1 = nn.BatchNorm2d(planes)
             self.norm2 = nn.BatchNorm2d(planes)
             if not stride == 1:
                 self.norm3 = nn.BatchNorm2d(planes)
         
+        # compute per-instance statistics for each channel (statistics over width, height)
+        # there is no shifting/scaling in contrast to the batch norm
         elif norm_fn == 'instance':
             self.norm1 = nn.InstanceNorm2d(planes)
             self.norm2 = nn.InstanceNorm2d(planes)
             if not stride == 1:
                 self.norm3 = nn.InstanceNorm2d(planes)
 
+        # no norming
         elif norm_fn == 'none':
             self.norm1 = nn.Sequential()
             self.norm2 = nn.Sequential()
             if not stride == 1:
                 self.norm3 = nn.Sequential()
 
+        # if the stride is 1, then no downsampling is required
         if stride == 1:
             self.downsample = None
         
+        # if stride is larger, then the processed features are smaller than the input
+        # thus, the input also needs to have the same convolution applied to it, so they have the same shape
         else:    
             self.downsample = nn.Sequential(
                 nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride), self.norm3)
 
 
     def forward(self, x):
+        """ apply one residual unit: 2*(actication, norm, convolution) and
+            residual additive connection of input with output
+
+        Args:   
+            x (torch.Tensor): image tensor of shape (batch, in_planes, ht, wd)
+
+        Returns:
+            torch.Tensor: image tensor of shape (batch, out_planes, ht, wd)
+        """
         y = x
         y = self.relu(self.norm1(self.conv1(y)))
         y = self.relu(self.norm2(self.conv2(y)))
@@ -53,6 +75,7 @@ class ResidualBlock(nn.Module):
         if self.downsample is not None:
             x = self.downsample(x)
 
+        # residual connection with input by addition
         return self.relu(x+y)
 
 
@@ -120,6 +143,7 @@ class BasicEncoder(nn.Module):
         super(BasicEncoder, self).__init__()
         self.norm_fn = norm_fn
 
+        # same norms as in the ResidualBlock
         if self.norm_fn == 'group':
             self.norm1 = nn.GroupNorm(num_groups=8, num_channels=64)
             
@@ -157,6 +181,15 @@ class BasicEncoder(nn.Module):
                     nn.init.constant_(m.bias, 0)
 
     def _make_layer(self, dim, stride=1):
+        """ create a layer that consists of two residual blocks
+
+        Args:
+            dim (int): number of output channels
+            stride (int, optional): stride of the convolutions. Defaults to 1.
+
+        Returns:
+            torch.nn.Module: Network consisting of two ResidualBlocks
+        """
         layer1 = ResidualBlock(self.in_planes, dim, self.norm_fn, stride=stride)
         layer2 = ResidualBlock(dim, dim, self.norm_fn, stride=1)
         layers = (layer1, layer2)
@@ -168,24 +201,29 @@ class BasicEncoder(nn.Module):
     def forward(self, x):
 
         # if input is list, combine batch dimension
+        # -> if two batches images are passed, add them to a single batch of double the size
         is_list = isinstance(x, tuple) or isinstance(x, list)
         if is_list:
             batch_dim = x[0].shape[0]
             x = torch.cat(x, dim=0)
 
+        # apply first conv-norm-activation layer
         x = self.conv1(x)
         x = self.norm1(x)
         x = self.relu1(x)
 
+        # apply composite residual layers
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
 
+        # apply final regression output layer
         x = self.conv2(x)
 
         if self.training and self.dropout is not None:
             x = self.dropout(x)
 
+        # if the input was a list of batches of images, split tensor and put into list again
         if is_list:
             x = torch.split(x, [batch_dim, batch_dim], dim=0)
 

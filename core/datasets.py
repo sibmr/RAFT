@@ -17,6 +17,14 @@ from utils.augmentor import FlowAugmentor, SparseFlowAugmentor
 
 class FlowDataset(data.Dataset):
     def __init__(self, aug_params=None, sparse=False):
+        """ constructor for base class of flow datasets
+            child classes for specific datasets need to implement this method
+            and load the data to the lists
+
+        Args:
+            aug_params (Object, optional): parameters for augmentation. Defaults to None.
+            sparse (bool, optional): whether images are sparse. Defaults to False.
+        """
         self.augmentor = None
         self.sparse = sparse
         if aug_params is not None:
@@ -78,10 +86,13 @@ class FlowDataset(data.Dataset):
             else:
                 img1, img2, flow = self.augmentor(img1, img2, flow)
 
+        # permutation: (h,w,c) -> (c,h,w)
         img1 = torch.from_numpy(img1).permute(2, 0, 1).float()
         img2 = torch.from_numpy(img2).permute(2, 0, 1).float()
         flow = torch.from_numpy(flow).permute(2, 0, 1).float()
 
+        # determine whether pixels are valid or not
+        # either loaded from dataset or if the displacement magnitude is too large
         if valid is not None:
             valid = torch.from_numpy(valid)
         else:
