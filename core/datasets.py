@@ -1,5 +1,21 @@
 # Data loading based on https://github.com/NVIDIA/flownet2-pytorch
 
+""" Dataset Module
+
+    FlowDataset:
+        base class for flow datasets
+        establishes naming conventions for attributes used by methods
+        initializes attributes
+        implements __getitem__ method used for gathering training/batch data
+        by DataLoader
+
+    Specific Dataset (MpiSintel, FlyingChairs, FlyingThings, KITTI, HD1K):
+        implement init method to load images into list
+    
+    fetch_dataloader:
+        creates a instance of DataLoader for the specified dataset (combinations)
+"""
+
 import numpy as np
 import torch
 import torch.utils.data as data
@@ -102,6 +118,17 @@ class FlowDataset(data.Dataset):
 
 
     def __rmul__(self, v):
+        """ multiply dataset by some scalar
+            this makes the dataset larger by factor v
+            useful for determining the mixture between different datasets
+            that are concatenated
+
+        Args:
+            v (int): multiplication factor
+
+        Returns:
+            data.Dataset: multiplied dataset of length len(prev)*v
+        """
         self.flow_list = v * self.flow_list
         self.image_list = v * self.image_list
         return self
@@ -208,7 +235,10 @@ class HD1K(FlowDataset):
 
 
 def fetch_dataloader(args, TRAIN_DS='C+T+K+S+H'):
-    """ Create the data loader for the corresponding trainign set """
+    """ Create the data loader for the corresponding trainign set 
+    
+        Adding two datasets here means to concatenate them 
+    """
 
     if args.stage == 'chairs':
         aug_params = {'crop_size': args.image_size, 'min_scale': -0.1, 'max_scale': 1.0, 'do_flip': True}
@@ -238,6 +268,7 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K+S+H'):
         aug_params = {'crop_size': args.image_size, 'min_scale': -0.2, 'max_scale': 0.4, 'do_flip': False}
         train_dataset = KITTI(aug_params, split='training')
 
+    # data loader is responsible for batching and shuffling from the dataset __getitem__ method
     train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, 
         pin_memory=False, shuffle=True, num_workers=4, drop_last=True)
 
