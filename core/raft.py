@@ -139,6 +139,9 @@ class RAFT(nn.Module):
             corr_fn = CorrBlock(fmap1, fmap2, radius=self.args.corr_radius)
 
         # run the context network (provides initial hidden state and context features)
+        # autocast context manager allows the region within to run in mixed-precision
+        # autocast can improve performance while maintaining accuracy by running operations
+        # in an operation-specific datatype for the in-/output tensors
         with autocast(enabled=self.args.mixed_precision):
             # the context network produces the initial hidden state (net) and the context features (inp) 
             cnet = self.cnet(image1)
