@@ -32,7 +32,16 @@ std::vector<torch::Tensor> corr_forward(
   return corr_cuda_forward(fmap1, fmap2, coords, radius);
 }
 
-
+/**
+ * @brief Backwards method for the alternate correlation
+ * 
+ * @param fmap1     feature map of image1 of shape (batch, ht, wd, fdim)
+ * @param fmap2     feature map of image2 of shape (batch, ht, wd, fdim)
+ * @param coords    current correspondence coordinates (batch, ht, wd, 2)
+ * @param corr_grad gradient coming from the indexed correlation volume 
+ * @param radius    correlation volume indexing radius
+ * @return std::vector<torch::Tensor> 
+ */
 std::vector<torch::Tensor> corr_backward(
     torch::Tensor fmap1,
     torch::Tensor fmap2,

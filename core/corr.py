@@ -39,13 +39,13 @@ class CorrBlock:
             self.corr_pyramid.append(corr)
 
     def __call__(self, coords):
-        """ query the correlation volume for a flow estimate
+        """ query the correlation volume pyramid with the current flow estimate
 
         Args:
             coords (torch.Tensor): pixel coordinates for image2, in relation to image1
 
         Returns:
-            torch.Tensor: _description_
+            torch.Tensor: indexed correlation volume (batch, num_levels*dim*(2*r+1)*(2*r+1), h1, w1)
         """
 
         # shorthand for grid radius
@@ -141,30 +141,72 @@ class CorrBlock:
 
 class AlternateCorrBlock:
     def __init__(self, fmap1, fmap2, num_levels=4, radius=4):
+        """ create the memory-saving, more computationally expensive correlation Block
+            this block can create the indexed correlation volume without computing it
+
+        Args:
+            fmap1 (torch.Tensor): image1 features of shape (batch, fdim, ht, wd)
+            fmap2 (torch.Tensor): image2 features of shape (batch, fdim, ht, wd)
+            num_levels (int, optional): number of pyramid levels. Defaults to 4.
+            radius (int, optional): correlation radius (infty norm). Defaults to 4.
+        """
         self.num_levels = num_levels
         self.radius = radius
 
+        # build pyramid of pooled feature maps
         self.pyramid = [(fmap1, fmap2)]
         for i in range(self.num_levels):
+            # do the actual average pooling operation to create a new pyramid level (kernel_size=2, stride=2)
+            # no overlap between kernel applications with kernel size 2, stride 2
+            # shapes: (batch, fdim, ht/2**(i+1), wd/2**(i+1))
+            # NOTE: This probably computes one pooling level more than required
             fmap1 = F.avg_pool2d(fmap1, 2, stride=2)
             fmap2 = F.avg_pool2d(fmap2, 2, stride=2)
             self.pyramid.append((fmap1, fmap2))
 
     def __call__(self, coords):
+        """ query the correlation volume pyramid with the current flow estimate
+            does not store the 4d correlation volume as intermediate result
+
+        Args:
+            coords (torch.Tensor): pixel coordinates for image2, in relation to image1
+
+        Returns:
+            torch.Tensor: indexed correlation volume (batch, num_levels*dim*(2*r+1)*(2*r+1), h1, w1)
+        """
+         # permutation: (batch, 2, ht, wd) -> (batch, ht, wd, 2)
         coords = coords.permute(0, 2, 3, 1)
         B, H, W, _ = coords.shape
+
+        # image feature dimension
         dim = self.pyramid[0][0].shape[1]
 
         corr_list = []
         for i in range(self.num_levels):
             r = self.radius
+
+            # image1 features
+            # shape: (batch, fdim, ht, wd) -> (batch, ht, wd, fdim) 
             fmap1_i = self.pyramid[0][0].permute(0, 2, 3, 1).contiguous()
+            # pooled image2 features
+            # shape: (batch, fdim, ht/2**i, wd/2**i) -> (batch, ht/2**i, wd/2**i, fdim)
             fmap2_i = self.pyramid[i][1].permute(0, 2, 3, 1).contiguous()
 
+            # scale coords to the current pyramid level
+            # shape: (batch, ht, wd, 2) -> (batch, 1, ht, wd, 2)
             coords_i = (coords / 2**i).reshape(B, 1, H, W, 2).contiguous()
+            
+            # compute correlation values on the grid around the current flow values for each pixel
             corr, = alt_cuda_corr.forward(fmap1_i, fmap2_i, coords_i, r)
+            
+            # removed 1-valued dimension of indexed 
             corr_list.append(corr.squeeze(1))
 
+        # concatenate grid values from all correlation levels
         corr = torch.stack(corr_list, dim=1)
         corr = corr.reshape(B, -1, H, W)
+
+        # divide correlation values by sqrt(feature_dim)
+        # each feature is f1.T @ f2
+        # somehow normalize by the length of the image feature size
         return corr / torch.sqrt(torch.tensor(dim).float())

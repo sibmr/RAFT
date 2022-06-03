@@ -15,6 +15,17 @@ bool within_bounds(int h, int w, int H, int W) {
   return h >= 0 && h < H && w >= 0 && w < W;
 }
 
+/**
+ * @brief Perform grid indexing using the image features
+ * 
+ * @tparam scalar_t   datatype of the tensor
+ * @param fmap1   Tensor containing image 1 features (full resolution) of shape (batch, ht, wd, fdim)
+ * @param fmap2   Tensor containing image 2 features (pooled) of shape (batch, ht/2**i, wd/2**i, fdim)
+ * @param coords  Current correspondence estimation of shape (batch, 1, ht, wd, 2)
+ * @param corr    indexed correlation volume of shape (batch, 1, (2*r+1)**2, ht, wd)
+ * @param r       Radius for correlation lookup
+ * @return __global__ 
+ */
 template <typename scalar_t>
 __global__ void corr_forward_kernel(
     const torch::PackedTensorAccessor32<scalar_t,4,torch::RestrictPtrTraits> fmap1,
@@ -23,31 +34,54 @@ __global__ void corr_forward_kernel(
     torch::PackedTensorAccessor32<scalar_t,5,torch::RestrictPtrTraits> corr,
     int r)
 {
-  const int b = blockIdx.x;
-  const int h0 = blockIdx.y * blockDim.x;
-  const int w0 = blockIdx.z * blockDim.y;
-  const int tid = threadIdx.x * blockDim.y + threadIdx.y;
 
-  const int H1 = fmap1.size(1);
-  const int W1 = fmap1.size(2);
-  const int H2 = fmap2.size(1);
-  const int W2 = fmap2.size(2);
-  const int N = coords.size(1);
-  const int C = fmap1.size(3);
+  // number of blocks
+  // shape: (batch, (ht+4-1)/4, (wd+8-1)/8) = (batch, ceil(ht/4), ceil(ht/8))
+  
+  // number of threads per block
+  // shape: (4,8)
+  const dim3 threads(BLOCK_H, BLOCK_W);
 
+  const int b = blockIdx.x; // current batch
+
+  // global starting x/y value for this block
+  const int h0 = blockIdx.y * blockDim.x;   // block_i * BLOCK_H
+  const int w0 = blockIdx.z * blockDim.y;   // block_j * BLOCK_W
+  
+  //                (0 to 3)  * 8          + (0 to 7)
+  const int tid = threadIdx.x * blockDim.y + threadIdx.y; // threadId that is unique within its block
+
+  const int H1 = fmap1.size(1); // ht of img1
+  const int W1 = fmap1.size(2); // wd of img1
+  const int H2 = fmap2.size(1); // ht of img2: ht/2**i
+  const int W2 = fmap2.size(2); // wd of img2: wd/2**i
+  const int N = coords.size(1); // 1
+  const int C = fmap1.size(3); // fdim of img features
+
+  // memory that is shared between all threads in one block
   __shared__ scalar_t f1[CHANNEL_STRIDE][BLOCK_HW+1];
   __shared__ scalar_t f2[CHANNEL_STRIDE][BLOCK_HW+1];
   __shared__ scalar_t x2s[BLOCK_HW];
   __shared__ scalar_t y2s[BLOCK_HW];
 
+  // stride over all channels
   for (int c=0; c<C; c+=CHANNEL_STRIDE) {
+    // go over all channels in the current stride (if BLOCK_HW==CHANNEL_STRIDE)
     for (int k=0; k<BLOCK_HW; k+=BLOCK_HW/CHANNEL_STRIDE) {
+      
+      //  k1 = (0 to 31) + (0 to 31) / 32
+      //  k1 = k if (CHANNEL_STRIDE = BLOCK_HW = 32)
       int k1 = k + tid / CHANNEL_STRIDE;
-      int h1 = h0 + k1 / BLOCK_W;
-      int w1 = w0 + k1 % BLOCK_W;
-      int c1 = tid % CHANNEL_STRIDE;
+      
+      // global pixel indices covererd by this block
+      int h1 = h0 + k1 / BLOCK_W; // h0 + (0 to 3)
+      int w1 = w0 + k1 % BLOCK_W; // w0 + (0 to 7)
+      int c1 = tid % CHANNEL_STRIDE;  // channel offset for this thread
 
-      auto fptr = fmap1[b][h1][w1];
+      // iterates over all global pixels covered by this block for each thread
+      auto fptr = fmap1[b][h1][w1]; // pointer to feature dimension at h1, w1
+
+      // assign the first 32 channels for this thread
       if (within_bounds(h1, w1, H1, W1))
         f1[c1][k1] = fptr[c+c1];
       else
@@ -60,8 +94,8 @@ __global__ void corr_forward_kernel(
       int h1 = h0 + threadIdx.x;
       int w1 = w0 + threadIdx.y;
       if (within_bounds(h1, w1, H1, W1)) {
-        x2s[tid] = coords[b][n][h1][w1][0];
-        y2s[tid] = coords[b][n][h1][w1][1];
+        x2s[tid] = coords[b][n][h1][w1][0]; // threadId to correspondenceX
+        y2s[tid] = coords[b][n][h1][w1][1]; // threadId to correspondenceY
       }
 
       scalar_t dx = x2s[tid] - floor(x2s[tid]);
@@ -256,25 +290,43 @@ __global__ void corr_backward_kernel(
 }
 
 
-
+/**
+ * @brief start point for the correlation lookup operation
+ *        calculates blocks and threads shape and launches kernel
+ * 
+ * @param fmap1   Tensor containing image 1 features (full resolution) of shape (batch, ht, wd, fdim)
+ * @param fmap2   Tensor containing image 2 features (pooled) of shape (batch, ht/2**i, wd/2**i, fdim)
+ * @param coords  Current correspondence estimation of shape (batch, 1, ht, wd, 2)
+ * @param radius  Radius for correlation lookup
+ * @return std::vector<torch::Tensor>   indexed correlation volume of shape (batch, 1, (2*r+1)**2, ht, wd)
+ */
 std::vector<torch::Tensor> corr_cuda_forward(
   torch::Tensor fmap1,
   torch::Tensor fmap2,
   torch::Tensor coords,
   int radius)
 {
-  const auto B = coords.size(0);
-  const auto N = coords.size(1);
-  const auto H = coords.size(2);
-  const auto W = coords.size(3);
+  const auto B = coords.size(0);  // batch
+  const auto N = coords.size(1);  // 1
+  const auto H = coords.size(2);  // ht
+  const auto W = coords.size(3);  // wd
 
-  const auto rd = 2 * radius + 1;
+  const auto rd = 2 * radius + 1; // lookup grid height and width
   auto opts = fmap1.options();
+
+  // allocate storage for result
   auto corr = torch::zeros({B, N, rd*rd, H, W}, opts);
   
+  // number of blocks
+  // shape: (batch, (ht+4-1)/4, (wd+8-1)/8) = (batch, ceil(ht/4), ceil(ht/8))
   const dim3 blocks(B, (H+BLOCK_H-1)/BLOCK_H, (W+BLOCK_W-1)/BLOCK_W);
+  
+  // number of threads per block
+  // shape: (4,8)
   const dim3 threads(BLOCK_H, BLOCK_W);
 
+  // for each pixel in each image in the batch, one thread will be executed
+  // launch kernel with packed accessors to allow for fast 32bit integer indexing
   corr_forward_kernel<float><<<blocks, threads>>>(
     fmap1.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
     fmap2.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
