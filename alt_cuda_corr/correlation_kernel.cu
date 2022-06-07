@@ -59,6 +59,7 @@ __global__ void corr_forward_kernel(
   const int C = fmap1.size(3); // fdim of img features
 
   // memory that is shared between all threads in one block
+  // this memory has much faster access times
   __shared__ scalar_t f1[CHANNEL_STRIDE][BLOCK_HW+1];
   __shared__ scalar_t f2[CHANNEL_STRIDE][BLOCK_HW+1];
   __shared__ scalar_t x2s[BLOCK_HW];
@@ -67,6 +68,7 @@ __global__ void corr_forward_kernel(
   // stride over all channels
   for (int c=0; c<C; c+=CHANNEL_STRIDE) {
     // go over all channels in the current stride (if BLOCK_HW==CHANNEL_STRIDE)
+    // load feature channels this thread is responsible for to shared memory
     for (int k=0; k<BLOCK_HW; k+=BLOCK_HW/CHANNEL_STRIDE) {
       
       //  k1 = (0 to 31) + (0 to 31) / 32
@@ -81,60 +83,85 @@ __global__ void corr_forward_kernel(
       // iterates over all global pixels covered by this block for each thread
       auto fptr = fmap1[b][h1][w1]; // pointer to feature dimension at h1, w1
 
-      // assign the first 32 channels for this thread
+      // assign the first 32 feature channels of image1 for this thread
       if (within_bounds(h1, w1, H1, W1))
         f1[c1][k1] = fptr[c+c1];
       else
         f1[c1][k1] = 0.0;
     }
 
+    // barrier: wait for other threads in this block to arrive
     __syncthreads();
 
+    // N=1 thus this only runs once
     for (int n=0; n<N; n++) {
+      // pixel coordinate for this thread
       int h1 = h0 + threadIdx.x;
       int w1 = w0 + threadIdx.y;
+      // if the current pixel is inside the bounds of the image
       if (within_bounds(h1, w1, H1, W1)) {
         x2s[tid] = coords[b][n][h1][w1][0]; // threadId to correspondenceX
         y2s[tid] = coords[b][n][h1][w1][1]; // threadId to correspondenceY
       }
 
+      // between-pixel correspondence coordinates
       scalar_t dx = x2s[tid] - floor(x2s[tid]);
       scalar_t dy = y2s[tid] - floor(y2s[tid]);
 
+      // grid width/height
       int rd = 2*r + 1;
+
+      // for each point on the grid (around the current/cor)
       for (int iy=0; iy<rd+1; iy++) {
         for (int ix=0; ix<rd+1; ix++) {
+          // for each channel this thread is responsible for
+          // load feature channels for this pixel to shared memory
           for (int k=0; k<BLOCK_HW; k+=BLOCK_HW/CHANNEL_STRIDE) {
+            // (0 to 31) + (0 to 31) / 31 = k
             int k1 = k + tid / CHANNEL_STRIDE;
+            // coordinates within this threads grid (around correspondence)
             int h2 = static_cast<int>(floor(y2s[k1]))-r+iy;
             int w2 = static_cast<int>(floor(x2s[k1]))-r+ix;
+            // the channel offset for this thread
             int c2 = tid % CHANNEL_STRIDE;
 
+            // pointer to features of current pixel
             auto fptr = fmap2[b][h2][w2];
+
+            // if current coordinates are within bounds
             if (within_bounds(h2, w2, H2, W2))
+              // assign feature of current channel to buffers for all threads
               f2[c2][k1] = fptr[c+c2];
             else
               f2[c2][k1] = 0.0;
           }
 
+          // barrier waits for all threads in block to arrive
           __syncthreads();
-      
+
+          // calculate partial feature dot product for current pixel and correspondence
           scalar_t s = 0.0;
           for (int k=0; k<CHANNEL_STRIDE; k++)
             s += f1[k][tid] * f2[k][tid];
 
+          // top-left: nw, top-right:ne, bottom-left:sw, bottom-right:se
+
+          // global indices for current neighbouring pixel indices (ix, iy)
           int ix_nw = H1*W1*((iy-1) + rd*(ix-1));
           int ix_ne = H1*W1*((iy-1) + rd*ix);
           int ix_sw = H1*W1*(iy + rd*(ix-1));
           int ix_se = H1*W1*(iy + rd*ix);
 
+          // contributions of current pixel to neighbouring grid-point bilinear interpolations
           scalar_t nw = s * (dy) * (dx);
           scalar_t ne = s * (dy) * (1-dx);
           scalar_t sw = s * (1-dy) * (dx);
           scalar_t se = s * (1-dy) * (1-dx);
 
+          // pointer to this threads pixel in the resulting indexed corr volume
           scalar_t* corr_ptr = &corr[b][n][0][h1][w1];
 
+          // add bilinear interpolation contribution to neighboring pixels
           if (iy > 0 && ix > 0 && within_bounds(h1, w1, H1, W1))
             *(corr_ptr + ix_nw) += nw;
 
